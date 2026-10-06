@@ -348,7 +348,22 @@ defmodule Snowflex.Transport.HttpTest do
 
       assert {:ok, built} = Http.options(opts)
       refute Keyword.has_key?(built, :connect_options)
-      assert Keyword.get(built, :finch) == MyApp.Finch.Snowflake
+      assert Keyword.get(built, :finch) == [name: MyApp.Finch.Snowflake]
+    end
+
+    test "wraps a bare :finch pool name into finch: [name: pool]" do
+      opts = @private_key_opts ++ [req_options: [finch: MyApp.Finch.Snowflake]]
+
+      assert {:ok, built} = Http.options(opts)
+      assert Keyword.get(built, :finch) == [name: MyApp.Finch.Snowflake]
+    end
+
+    test "passes finch: [name: pool] through unchanged" do
+      opts = @private_key_opts ++ [req_options: [finch: [name: MyApp.Finch.Snowflake]]]
+
+      assert {:ok, built} = Http.options(opts)
+      refute Keyword.has_key?(built, :connect_options)
+      assert Keyword.get(built, :finch) == [name: MyApp.Finch.Snowflake]
     end
 
     test "keeps :connect_options when no :finch instance is supplied" do
@@ -368,6 +383,38 @@ defmodule Snowflex.Transport.HttpTest do
     test "enables compressed (gzip) by default" do
       assert {:ok, built} = Http.options(@private_key_opts)
       assert Keyword.get(built, :compressed) == true
+    end
+  end
+
+  # Uses the same throwaway key fixture already committed in the test suite.
+  @lazy_pem File.read!("test/fixtures/fake_private_key.pem")
+
+  @lazy_opts [
+    account_name: "test-account",
+    username: "test_user",
+    private_key_from_string: @lazy_pem
+  ]
+
+  describe "lazy: true" do
+    test "start_link succeeds without reaching Snowflake" do
+      # With lazy: true the SELECT 1 connection check is skipped, so the
+      # GenServer starts even though no real Snowflake endpoint is reachable.
+      assert {:ok, pid} = Http.start_link(@lazy_opts ++ [lazy: true])
+      assert Process.alive?(pid)
+      GenServer.stop(pid)
+    end
+
+    test "start_link without lazy: true fails when Snowflake is unreachable" do
+      # Baseline: without the option, init tries SELECT 1 and stops on error.
+      Process.flag(:trap_exit, true)
+
+      case Http.start_link(@lazy_opts) do
+        {:error, %Error{}} ->
+          :ok
+
+        {:ok, pid} ->
+          assert_receive {:EXIT, ^pid, _reason}, 5_000
+      end
     end
   end
 end

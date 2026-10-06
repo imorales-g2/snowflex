@@ -22,7 +22,12 @@ defmodule Snowflex.Transport.Http do
   * `:warehouse` - Default warehouse to use
   * `:role` - Default role to use
   * `:timeout` - Query timeout in milliseconds (default: 45 seconds)
-  * `:token_lifetime` - JWT token lifetime in milliseconds (default: 10 minutes)
+  * `:token_lifetime` - JWT token lifetime in milliseconds (default: 10 minutes).
+    The signed token is cached and re-signed at the start of any call it cannot
+    outlast: when less than that call's `:timeout` plus 30 seconds remains. If
+    `:timeout` plus 30 seconds reaches the lifetime, every call signs a new token.
+    For long timeouts, set a lifetime near Snowflake's 1 hour maximum (e.g.
+    `:timer.minutes(55)`) so the token stays cached across calls.
   * `:private_key_password` - Password for the private key (if encrypted)
   * `:async_poll_interval` - Interval in milliseconds to poll for async execution status (default: 1000)
   * `:max_retries` - Maximum retry attempts for rate limits (default: 3)
@@ -30,6 +35,7 @@ defmodule Snowflex.Transport.Http do
   * `:retry_max_delay` - Maximum delay between retries in milliseconds (default: 8000)
   * `:connect_options` - Connection options for Finch pool configuration. Ignored when a `:finch` instance is supplied via `:req_options`, because Req forbids setting both.
   * `:req_options` - Additional options to pass to `Req.new/1` (e.g., `:plug` for testing, or `:finch` to route requests at a dedicated Finch pool)
+  * `:lazy` - When `true`, skips the `SELECT 1` connection check during `init/1`. The transport starts immediately even if Snowflake is unreachable, and the first real query will surface any connectivity error. Defaults to `false`. Set this when hosting the repo under an intermediate supervisor that should isolate boot-time Snowflake failures from the rest of the application.
 
   ## Account Name Handling
 
@@ -114,9 +120,16 @@ defmodule Snowflex.Transport.Http do
 
   @default_token_lifetime :timer.minutes(10)
   @default_timeout :timer.seconds(45)
+  @call_timeout_grace :timer.seconds(5)
+  # Grace on top of a call's timeout when deciding whether the cached JWT can
+  # outlast that call. Covers Req retries, the +30s task extension in
+  # gather_results/3, and clock skew between us and Snowflake.
+  @token_refresh_margin :timer.seconds(30)
+  # Snowflake's "JWT token is invalid / expired" error code.
+  @expired_token_codes ["390198"]
   defmodule State do
     @moduledoc false
-    @derive {Inspect, except: [:private_key, :private_key_password]}
+    @derive {Inspect, except: [:private_key, :private_key_password, :auth_token]}
 
     defstruct [
       :account_name,
@@ -138,7 +151,10 @@ defmodule Snowflex.Transport.Http do
       :retry_base_delay,
       :retry_max_delay,
       :connect_options,
-      :req_options
+      :req_options,
+      :auth_token,
+      :auth_token_expires_at,
+      lazy: false
     ]
 
     @type t :: %__MODULE__{
@@ -161,7 +177,10 @@ defmodule Snowflex.Transport.Http do
             retry_base_delay: non_neg_integer(),
             retry_max_delay: non_neg_integer(),
             connect_options: Keyword.t(),
-            req_options: Keyword.t()
+            req_options: Keyword.t(),
+            auth_token: String.t() | nil,
+            auth_token_expires_at: integer() | nil,
+            lazy: boolean()
           }
   end
 
@@ -202,6 +221,93 @@ defmodule Snowflex.Transport.Http do
   end
 
   @impl Snowflex.Transport
+  def submit_async(pid, statement, params, opts) do
+    opts = add_default_timeout(opts)
+
+    with :ok <- validate_submission_identity(opts) do
+      pid
+      |> call({:submit_async, statement, params, opts}, statement, opts)
+      |> put_submission_identity(opts[:request_id])
+    end
+  end
+
+  # Validate before dispatch so a malformed identity cannot submit a statement.
+  defp validate_submission_identity(opts) do
+    request_id = opts[:request_id]
+    retry = Keyword.get(opts, :retry, false)
+
+    cond do
+      Keyword.has_key?(opts, :request_id) and not valid_request_id?(request_id) ->
+        {:error,
+         Error.exception(
+           ":request_id must be a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+         )}
+
+      not is_boolean(retry) ->
+        {:error, Error.exception(":retry must be a boolean")}
+
+      retry and is_nil(request_id) ->
+        {:error, Error.exception(":retry requires the original :request_id")}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp valid_request_id?(id) when is_binary(id) do
+    Regex.match?(~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i, id)
+  end
+
+  defp valid_request_id?(_id), do: false
+
+  defp put_submission_identity(reply, nil), do: reply
+
+  defp put_submission_identity({:ok, %Result{} = result}, request_id) do
+    {:ok, %{result | request_id: request_id}}
+  end
+
+  defp put_submission_identity({:error, %Error{} = error}, request_id) do
+    {:error, %{error | metadata: Map.put(error.metadata || %{}, :request_id, request_id)}}
+  end
+
+  @impl Snowflex.Transport
+  def statement_status(pid, handle, opts) do
+    opts = add_default_timeout(opts)
+    call(pid, {:statement_status, handle, opts}, handle, opts)
+  end
+
+  @impl Snowflex.Transport
+  def fetch_result(pid, handle, opts) do
+    opts = add_default_timeout(opts)
+    call(pid, {:fetch_result, handle, opts}, handle, opts)
+  end
+
+  @impl Snowflex.Transport
+  def cancel_statement(pid, handle, opts) do
+    opts = add_default_timeout(opts)
+    call(pid, {:cancel_statement, handle, opts}, handle, opts)
+  end
+
+  # The handler bounds its own HTTP request with opts[:timeout]; give the
+  # GenServer.call a grace period on top so a request that is merely slow
+  # surfaces as the handler's {:error, _} instead of racing the call deadline and
+  # exiting. Without the catch an exit propagates out of
+  # Snowflex.Connection.handle_execute/4 and DBConnection re-raises it, so the
+  # caller never sees a Snowflex.Error.
+  defp call(pid, message, subject, opts) do
+    GenServer.call(pid, message, call_timeout(opts[:timeout]))
+  catch
+    :exit, {:timeout, _} ->
+      {:error, Error.exception("#{subject} timed out after #{inspect(opts[:timeout])}")}
+
+    :exit, reason ->
+      {:error, Error.exception("#{subject} failed due to #{inspect(reason)}")}
+  end
+
+  defp call_timeout(:infinity), do: :infinity
+  defp call_timeout(timeout) when is_integer(timeout), do: timeout + @call_timeout_grace
+
+  @impl Snowflex.Transport
   def disconnect(pid) do
     if Process.alive?(pid) do
       Process.exit(pid, :normal)
@@ -236,9 +342,11 @@ defmodule Snowflex.Transport.Http do
   only the subset we rely upon.  Your use case might necessitate changing/modifying/adding other options however.
 
   To route Snowflake requests at a dedicated `Finch` pool, pass it via `:req_options`, e.g.
-  `req_options: [finch: MyFinch]`. When a `:finch` instance is provided this way, `Http` omits
-  `:connect_options` so the two do not conflict (`Req` does not allow specifying `:connect_options`
-  and `:finch` at the same time); the Finch pool then owns the connection configuration.
+  `req_options: [finch: [name: MyFinch]]`. The bare pool name (`req_options: [finch: MyFinch]`)
+  is also accepted and normalized to the keyword form (Req 0.7 deprecated the bare name).
+  When a `:finch` pool is provided this way, `Http` omits `:connect_options` so the two do
+  not conflict (`Req` does not allow specifying `:connect_options` and `:finch` at the same
+  time); the Finch pool then owns the connection configuration.
 
   `options/1` remains available when you need to build the Req client yourself and modify it further:
 
@@ -251,7 +359,7 @@ defmodule Snowflex.Transport.Http do
 
     options
     |> Keyword.delete(:connect_options)
-    |> Keyword.put(:finch, MyFinch)
+    |> Keyword.put(:finch, name: MyFinch)
     |> Req.new()
   ```
   """
@@ -277,20 +385,25 @@ defmodule Snowflex.Transport.Http do
     with {:ok, validated_opts, private_key} <- validate_and_read_private_key(opts),
          {:ok, opts_with_fingerprint} <- resolve_fingerprint(validated_opts, private_key),
          {:ok, state} <- init_state(opts_with_fingerprint, private_key) do
-      check_connection(state)
+      maybe_check_connection(state)
     end
   end
 
   def handle_call(:client, _from, state) do
+    state = refresh_token(state, state.timeout)
     {:reply, build_req_client(state), state}
   end
 
   @impl GenServer
   def handle_call({:execute, statement, params, opts}, _from, state) do
+    state = refresh_token(state, opts[:timeout])
+
     with {:ok, status, body} <- fetch_statement(state, statement, params, opts),
          #  After 45 seconds, Snowflake will return a 202 status code and a body with a statementHandle
          #  We need to poll for the result set
-         {:ok, body} <- await_async_execution(state, status, body),
+         # Polling may re-sign an expired token; carry that state forward so the
+         # partition fetches (and later calls) use the new token.
+         {:ok, body, state} <- await_async_execution(state, status, body),
          # Once we have the initial body, we might need to make additional requests
          # to gather the partitions
          # We will reduce over the partitions to get the full result set
@@ -304,6 +417,8 @@ defmodule Snowflex.Transport.Http do
   end
 
   def handle_call({:declare, statement, params, opts}, _from, state) do
+    state = refresh_token(state, opts[:timeout])
+
     # Long-running statements answer 202 before the result set exists, so poll
     # to completion (like :execute does) before reading partition metadata.
     with {:ok, status, body} <- fetch_statement(state, statement, params, opts),
@@ -311,7 +426,7 @@ defmodule Snowflex.Transport.Http do
           %{
             "statementHandle" => statement_handle,
             "resultSetMetaData" => %{"partitionInfo" => partitions} = metadata
-          }} <- await_async_execution(state, status, body) do
+          }, state} <- await_async_execution(state, status, body) do
       {:reply, {:ok, length(partitions) - 1},
        %{
          state
@@ -323,7 +438,7 @@ defmodule Snowflex.Transport.Http do
       {:error, error} ->
         {:reply, {:error, error}, state}
 
-      {:ok, body} ->
+      {:ok, body, _state} ->
         error =
           Error.exception(
             "statement did not return a partitioned result set " <>
@@ -332,6 +447,49 @@ defmodule Snowflex.Transport.Http do
 
         {:reply, {:error, error}, state}
     end
+  end
+
+  # Fire-and-forget submission. Snowflake answers `async=true` with 202 and a
+  # statement handle as soon as it accepts the statement, so this deliberately
+  # does NOT call await_async_execution/3 — polling here is what pins the
+  # connection for the statement's full duration. It also leaves
+  # :current_statement alone: that field belongs to the cursor path, and
+  # overwriting it would corrupt an in-flight stream on the same connection.
+  def handle_call({:submit_async, statement, params, opts}, _from, state) do
+    state = refresh_token(state, opts[:timeout])
+
+    reply =
+      case fetch_statement(state, statement, params, opts, async?: true) do
+        {:ok, _status, %{"statementHandle" => handle} = body} when is_binary(handle) ->
+          {:ok, handle_result(body, handle)}
+
+        {:ok, _status, body} ->
+          {:error,
+           Error.exception(
+             "Snowflake accepted the statement but returned no usable statementHandle: " <>
+               inspect(body)
+           )}
+
+        {:error, error} ->
+          {:error, error}
+      end
+
+    {:reply, reply, state, :hibernate}
+  end
+
+  def handle_call({:statement_status, handle, opts}, _from, state) do
+    state = refresh_token(state, opts[:timeout])
+    {:reply, request_statement_status(state, handle, opts), state, :hibernate}
+  end
+
+  def handle_call({:fetch_result, handle, opts}, _from, state) do
+    state = refresh_token(state, opts[:timeout])
+    {:reply, request_result(state, handle, opts), state, :hibernate}
+  end
+
+  def handle_call({:cancel_statement, handle, opts}, _from, state) do
+    state = refresh_token(state, opts[:timeout])
+    {:reply, request_cancel(state, handle, opts), state, :hibernate}
   end
 
   def handle_call(
@@ -344,6 +502,8 @@ defmodule Snowflex.Transport.Http do
         } = state
       )
       when current_partition <= max_partition do
+    state = refresh_token(state, opts[:timeout])
+
     case fetch_partition(state, current_statement, current_partition, opts) do
       {:ok, result} ->
         # Partition responses carry only data, so attach the statement's
@@ -401,22 +561,28 @@ defmodule Snowflex.Transport.Http do
   defp await_async_execution(state, 202, %{"statementHandle" => statement_handle}) do
     url = "/api/v2/statements/#{statement_handle}"
 
-    req_client = build_req_client(state)
+    # Keep the (possibly re-signed) state so later polls, and the caller's
+    # follow-up requests, reuse the new token instead of each tripping over the
+    # expired one.
+    {response, state} =
+      with_token_retry(state, fn state ->
+        Req.get(build_req_client(state), url: url, receive_timeout: state.timeout)
+      end)
 
-    case Req.get(req_client, url: url, receive_timeout: state.timeout) do
+    case response do
       {:ok, %{status: 202, body: body}} ->
         Process.sleep(state.async_poll_interval)
         await_async_execution(state, 202, body)
 
       {:ok, %{status: status, body: body}} when status in 200..299 ->
-        {:ok, body}
+        {:ok, body, state}
 
       {:ok, %{body: %{"code" => code, "message" => message}}} ->
         {:error, %Error{message: String.replace(message, ~r/\n/, " "), code: code}}
     end
   end
 
-  defp await_async_execution(_state, _status, body), do: {:ok, body}
+  defp await_async_execution(state, _status, body), do: {:ok, body, state}
 
   defp gather_results(state, %{"statementHandles" => statement_handles}, opts) do
     max_concurrency = System.schedulers_online()
@@ -427,7 +593,7 @@ defmodule Snowflex.Transport.Http do
       statement_handles,
       fn handle ->
         case await_async_execution(state, 202, %{"statementHandle" => handle}) do
-          {:ok, body} -> gather_results(state, body, opts)
+          {:ok, body, state} -> gather_results(state, body, opts)
           {:error, error} -> {:error, error}
         end
       end,
@@ -590,8 +756,23 @@ defmodule Snowflex.Transport.Http do
        retry_base_delay: Keyword.get(validated_opts, :retry_base_delay, 1000),
        retry_max_delay: Keyword.get(validated_opts, :retry_max_delay, 8000),
        connect_options: Keyword.get(validated_opts, :connect_options, []),
-       req_options: Keyword.get(validated_opts, :req_options, [])
-     }}
+       req_options: validated_opts |> Keyword.get(:req_options, []) |> normalize_finch_option(),
+       lazy: Keyword.get(validated_opts, :lazy, false)
+     }
+     |> then(&refresh_token(&1, &1.timeout))}
+  end
+
+  # Req 0.7 deprecated setting `:finch` to a bare pool name in favor of
+  # `finch: [name: pool]`; wrap the bare name so existing configs keep working
+  # without triggering the deprecation warning.
+  defp normalize_finch_option(req_options) do
+    case Keyword.fetch(req_options, :finch) do
+      {:ok, pool} when is_atom(pool) and not is_nil(pool) ->
+        Keyword.put(req_options, :finch, name: pool)
+
+      _other ->
+        req_options
+    end
   end
 
   # Use an explicitly-configured fingerprint when present (backward compatible);
@@ -633,11 +814,51 @@ defmodule Snowflex.Transport.Http do
     end
   end
 
+  defp maybe_check_connection(%State{lazy: true} = state), do: {:ok, state}
+  defp maybe_check_connection(state), do: check_connection(state)
+
   # Token helpers
+
+  # Signing a JWT costs a PEM decode plus an RSA private-key operation, so the
+  # token is cached instead of being rebuilt per request. This matters most for
+  # async polling, where one logical workflow issues many requests. Callers that
+  # cannot update the GenServer state (the parallel partition fetches, and the
+  # public options/1) reuse whatever is cached.
+  #
+  # A call can run for up to its timeout (polling and partition fetches all
+  # reuse the token), so the cached token is only kept when it outlives the
+  # whole call plus @token_refresh_margin. With a timeout close to (or above)
+  # :token_lifetime this re-signs on every call, which is correct, just less
+  # cached. An :infinity call cannot be bounded, so it always starts with a
+  # freshly signed token; with_token_retry/2 covers the rest.
+  defp refresh_token(%State{auth_token: nil} = state, _timeout), do: force_refresh_token(state)
+  defp refresh_token(%State{} = state, :infinity), do: force_refresh_token(state)
+
+  defp refresh_token(%State{} = state, timeout) when is_integer(timeout) do
+    now = System.system_time(:millisecond)
+
+    if now + timeout + @token_refresh_margin >= state.auth_token_expires_at do
+      force_refresh_token(state)
+    else
+      state
+    end
+  end
+
+  defp force_refresh_token(%State{} = state) do
+    %{
+      state
+      | auth_token: generate_token(state),
+        auth_token_expires_at: System.system_time(:millisecond) + token_lifetime(state)
+    }
+  end
+
+  defp token_lifetime(%State{token_lifetime: lifetime}), do: lifetime
 
   defp generate_token(state) do
     now = System.system_time(:second)
-    expires_at = now + state.token_lifetime
+    # :token_lifetime is configured in milliseconds, but a JWT `exp` claim is a
+    # POSIX timestamp in seconds.
+    expires_at = now + div(token_lifetime(state), 1000)
 
     account_id = prepare_account_name_for_jwt(state.account_name)
     username = String.upcase(state.username)
@@ -685,7 +906,7 @@ defmodule Snowflex.Transport.Http do
     base_options = [
       base_url: base_url,
       headers: [
-        {"Authorization", "Bearer #{generate_token(state)}"},
+        {"Authorization", "Bearer #{state.auth_token || generate_token(state)}"},
         {"Content-Type", "application/json"},
         {"Accept", "application/json"},
         {"User-Agent", "snowflex/#{snowflex_version()}"},
@@ -793,10 +1014,10 @@ defmodule Snowflex.Transport.Http do
 
   # HTTP Calls
 
-  defp fetch_statement(state, statement, params, opts) do
+  defp fetch_statement(state, statement, params, opts, call_opts \\ []) do
     req_body = %{
       statement: statement,
-      timeout: opts[:timeout],
+      timeout: statement_timeout_seconds(opts[:statement_timeout] || opts[:timeout]),
       database: state.database,
       schema: state.schema,
       warehouse: state.warehouse,
@@ -809,7 +1030,23 @@ defmodule Snowflex.Transport.Http do
 
     req_client = build_req_client(state)
 
-    case Req.post(req_client, url: url, json: req_body, receive_timeout: opts[:timeout]) do
+    # `async=true` makes Snowflake acknowledge with 202 + statementHandle
+    # immediately instead of holding the response open until the statement
+    # finishes (or until its own ~45s cutoff). Req treats an empty *list* as
+    # "no params" and leaves the URL untouched; an empty map would take the
+    # encode path instead.
+    query_params = if call_opts[:async?], do: submission_query_params(opts), else: []
+
+    # Recovery owns resubmission. Do not let Req repeat an async POST (including
+    # one configured with retry: :transient) without an explicit caller retry.
+    req_client = if call_opts[:async?], do: Req.merge(req_client, retry: false), else: req_client
+
+    case Req.post(req_client,
+           url: url,
+           json: req_body,
+           params: query_params,
+           receive_timeout: opts[:timeout]
+         ) do
       {:ok, %{status: status, body: body}} when status in 200..299 ->
         {:ok, status, body}
 
@@ -852,12 +1089,26 @@ defmodule Snowflex.Transport.Http do
     end
   end
 
+  defp submission_query_params(opts) do
+    params = [async: true]
+    params = if opts[:request_id], do: params ++ [requestId: opts[:request_id]], else: params
+    if opts[:retry], do: params ++ [retry: true], else: params
+  end
+
   defp fetch_partition(state, statement_handle, partition_index, opts) do
     url = "/api/v2/statements/#{statement_handle}"
     params = %{partition: partition_index}
-    req_client = build_req_client(state)
 
-    case Req.get(req_client, url: url, params: params, receive_timeout: opts[:timeout]) do
+    {response, _state} =
+      with_token_retry(state, fn state ->
+        Req.get(build_req_client(state),
+          url: url,
+          params: params,
+          receive_timeout: opts[:timeout]
+        )
+      end)
+
+    case response do
       {:ok, %{status: status, body: partition_body}} when status in 200..299 ->
         {:ok, partition_body}
 
@@ -883,6 +1134,156 @@ defmodule Snowflex.Transport.Http do
            }
          }}
     end
+  end
+
+  # Snowflake reports async statement state through the status code of a plain
+  # GET on the handle: 202 while it is still running, 2xx once it succeeded, and
+  # 422 when it finished with an error.
+  defp request_statement_status(state, handle, opts) do
+    case get_statement(state, handle, opts) do
+      {:ok, :running, _body} -> {:ok, :running}
+      {:ok, :succeeded, _body} -> {:ok, :succeeded}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  # Reuses the same partition-gathering and formatting the synchronous execute
+  # path uses, so a handle's rows decode exactly like a normal query's.
+  defp request_result(state, handle, opts) do
+    with {:ok, :succeeded, body} <- get_statement(state, handle, opts),
+         {:ok, raw_result} <- gather_results(state, body, opts) do
+      {:ok, format_response_body(raw_result)}
+    else
+      {:ok, :running, _body} -> {:ok, :running}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp get_statement(state, handle, opts) do
+    # Snowflake keeps answering 202 for as long as the statement runs, so a
+    # transient-retry here would burn the caller's whole timeout budget
+    # re-asking a question that was already answered. Ask exactly once.
+    {response, _state} =
+      with_token_retry(state, fn state ->
+        Req.get(build_req_client(state),
+          url: statement_url(handle),
+          receive_timeout: opts[:timeout],
+          retry: false
+        )
+      end)
+
+    case response do
+      {:ok, %{status: 202, body: body}} -> {:ok, :running, body}
+      {:ok, %{status: status, body: body}} when status in 200..299 -> {:ok, :succeeded, body}
+      {:ok, response} -> {:error, statement_error(response, handle, opts)}
+      {:error, exception} -> {:error, transport_error(exception, handle, opts)}
+    end
+  end
+
+  defp request_cancel(state, handle, opts) do
+    {response, _state} =
+      with_token_retry(state, fn state ->
+        Req.post(build_req_client(state),
+          url: statement_url(handle) <> "/cancel",
+          receive_timeout: opts[:timeout]
+        )
+      end)
+
+    case response do
+      {:ok, %{status: status, body: body}} when status in 200..299 ->
+        {:ok, handle_result(body, handle)}
+
+      {:ok, response} ->
+        {:error, statement_error(response, handle, opts)}
+
+      {:error, exception} ->
+        {:error, transport_error(exception, handle, opts)}
+    end
+  end
+
+  defp statement_url(handle), do: "/api/v2/statements/#{handle}"
+
+  # Backstop for a token that expires mid-call despite refresh_token/2 (e.g. an
+  # :infinity call, or clock skew). Only wraps requests addressed to an existing
+  # statement handle, so a retry never resubmits the statement. Retries at most
+  # once; a second rejection takes the caller's normal error path. Returns the
+  # re-signed state so pollers can keep using the new token.
+  defp with_token_retry(state, request_fun) do
+    case request_fun.(state) do
+      {:ok, %{body: %{"code" => code}}} = response ->
+        if to_string(code) in @expired_token_codes do
+          Logger.warning(
+            "Snowflake rejected an expired JWT (#{code}); re-signing and retrying once"
+          )
+
+          state = force_refresh_token(state)
+          {request_fun.(state), state}
+        else
+          {response, state}
+        end
+
+      response ->
+        {response, state}
+    end
+  end
+
+  # Snowflake's `timeout` request field is a number of SECONDS, while every
+  # Snowflex timeout option is in milliseconds. Passing the millisecond value
+  # through told Snowflake to wait ~12.5 hours for the default 45_000, which
+  # effectively disabled the server-side statement timeout. Round up so a
+  # sub-second timeout does not become 0, which Snowflake reads as "no timeout".
+  defp statement_timeout_seconds(:infinity), do: 0
+  defp statement_timeout_seconds(nil), do: nil
+
+  defp statement_timeout_seconds(timeout) when is_integer(timeout) and timeout > 0 do
+    max(div(timeout + 999, 1000), 1)
+  end
+
+  defp statement_timeout_seconds(timeout), do: timeout
+
+  # Handle-addressed acknowledgements (submit, cancel) carry no rows, and their
+  # body is not guaranteed to be a JSON object, so build the Result from the
+  # handle we already know instead of reading it back out of the body.
+  defp handle_result(body, handle) do
+    body = normalize_body(body)
+
+    %Result{
+      query_id: handle,
+      request_id: body["requestId"],
+      sql_state: body["sqlState"],
+      rows: nil,
+      num_rows: 0
+    }
+  end
+
+  defp normalize_body(body) when is_map(body), do: body
+  defp normalize_body(_body), do: %{}
+
+  defp statement_error(%{status: status, body: body}, handle, opts) do
+    case body do
+      %{"code" => code, "message" => message} ->
+        %Error{
+          message: String.replace(message, ~r/\n/, " "),
+          code: to_string(code),
+          sql_state: Map.get(body, "sqlState"),
+          metadata: %{query_id: handle, statement: handle, response: body, opts: opts}
+        }
+
+      _any ->
+        %Error{
+          message: "HTTP #{status}: #{inspect(body)}",
+          code: to_string(status),
+          metadata: %{query_id: handle, statement: handle, response: body, opts: opts}
+        }
+    end
+  end
+
+  defp transport_error(exception, handle, opts) do
+    %Error{
+      message: inspect(exception),
+      code: "HTTP_ERROR",
+      metadata: %{query_id: handle, statement: handle, opts: opts}
+    }
   end
 
   defp params_to_bindings(params) do
